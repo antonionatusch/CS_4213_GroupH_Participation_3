@@ -21,32 +21,39 @@
 - From outside, it looks like the Project "changes its class" as it transitions
 
 ### Structure
-The three key components are all present:
+The key components are all present:
 
-1. **Context** (`Project.cs`, `Task.cs`)
-   - Maintains reference to current state: `private IProjectState _currentState;`
-   - Delegates operations: `public void Submit() => _currentState.Submit(this);`
+1. **Context** (`Project.cs`, `ProjectTask.cs`)
+   - Maintains reference to current state: `public IProjectState State { get; private set; }`
+   - Delegates operations via helper: `public void Submit() => Transition(s => s.Submit(this));`
+   - Transition helper validates and updates state
 
-2. **State Interface** (`IProjectState.cs`, `ITaskState.cs`)
+2. **State Interface** (`IProjectState.cs`, `IProjectTaskState.cs`)
    - Defines operations all states must implement
-   - Example: `void Submit(Project context);`
+   - Example: `IProjectState Submit(Project ctx);` - returns next state
 
-3. **Concrete States** (`ProjectStates.cs`, `TaskStates.cs`)
-   - Implement the interface: `public class DraftState : IProjectState`
-   - Handle transitions: `public void Submit(Project context) => context.SetState(new SubmittedState());`
+3. **Base State Classes** (`ProjectStateBase.cs`, `ProjectTaskStateBase.cs`)
+   - Provide default implementation for all interface methods
+   - Invalid operations return `this` (current state) with logging
+
+4. **Concrete States** (Individual files per state)
+   - Extend base class: `public sealed class DraftState : ProjectStateBase`
+   - Use Singleton pattern: `public static DraftState Instance { get; } = new();`
+   - Handle valid transitions by returning next state: `return SubmittedState.Instance;`
 
 ### Collaboration Between Classes
 ```
-Project ──delegates──> IProjectState <──implements── DraftState
-   │                                   <──implements── ActiveState
-   │                                   <──implements── CompletedState
-   │                                           │
-   └──────calls SetState()──────────────────────┘
+Project ──delegates via Transition()──> IProjectState <──extends── ProjectStateBase <──sealed── DraftState
+   │                                                                                   <──sealed── ActiveState
+   │                                                                                   <──sealed── CompletedState
+   │                                                                                          │
+   └──────receives next state and updates State property <─────────────────────────returns──┘
 ```
 
-- Context delegates to current state
-- States decide on transitions and call `context.SetState()`
-- This creates a clean separation of concerns
+- Context delegates to current state via `Transition()` helper
+- States decide on transitions and **return** the next state (or `this` if invalid)
+- Context validates the returned state and updates if different
+- This creates a clean separation of concerns with type-safe transitions
 
 ---
 
@@ -72,12 +79,18 @@ Located in `ProjectStates.cs`:
 **Valid Transitions:**
 ```
 Draft → Submit → Submitted → Approve → Approved → Kickoff → Active
-                                          ↓                    ↓
-                                       OnHold              AtRisk/OnHold
-                                          ↓                    ↓
-                                       Resume              Complete
-                                          ↓                    ↓
-                                       Active            Completed → Archive → Archived
+         ↑           ↓                                         ↓
+         └─────── Reject                             KpiBreach/Finish
+                                                          ↓       ↓
+                                                      AtRisk  Completed
+                                                        ↓           ↓
+                                              Pause/Resume/Finish  Finalize
+                                                        ↓           ↓
+                                                     OnHold     Archived
+                                                        ↓
+                                                      Resume
+                                                        ↓
+                                                      Active
 ```
 
 ### ✅ Task Lifecycle - All 5 States Implemented
@@ -90,13 +103,14 @@ Located in `TaskStates.cs`:
 
 **Valid Transitions:**
 ```
-Pending → Assign → Assigned → StartWork → InProgress → Complete → Completed → Verify → Verified
+Pending → Assign → Assigned → Start → InProgress → Complete → Completed → Verify → Verified
 ```
 
 ### Nested Relationship
-- Projects contain Tasks: `public List<Task> Tasks { get; private set; }`
-- Both use State Pattern independently
+- Projects contain a SubTask: `public ProjectTask SubTask { get; }`
+- Both use State Pattern independently with their own state machines
 - Demonstrates pattern can be nested/composed
+- Project can interact with SubTask state (e.g., ApprovedState assigns the SubTask during Kickoff)
 
 **Ready for group discussion.**
 
@@ -114,112 +128,225 @@ Pending → Assign → Assigned → StartWork → InProgress → Complete → Co
 ### What Was Created
 
 #### 1. Context Classes (Delegates Behavior)
-**Project.cs** (42 lines)
+**Project.cs** (41 lines)
 ```csharp
 public class Project
 {
-    private IProjectState _currentState;  // Holds current state
+    public string Title { get; }
+    public IProjectState State { get; private set; }
+    public ProjectTask SubTask { get; }
     
-    // Delegates all operations
-    public void Submit() => _currentState.Submit(this);
-    public void Approve() => _currentState.Approve(this);
-    // ... etc
+    public Project(string title)
+    {
+        Title = title;
+        State = DraftState.Instance;
+        SubTask = new ProjectTask($"{title} - Initial Task");
+        Log($"Created Project in state: {State.Name}");
+    }
+    
+    // Delegates all operations via Transition helper
+    public void Submit() => Transition(s => s.Submit(this));
+    public void Approve() => Transition(s => s.Approve(this));
+    public void Finish() => Transition(s => s.Finish(this));
+    // ... 9 total operations
+    
+    private void Transition(Func<IProjectState, IProjectState> f)
+    {
+        var next = f(State);
+        if (!ReferenceEquals(next, State))
+        {
+            Log($"Transition: {State.Name} -> {next.Name}");
+            State = next!;
+        }
+    }
 }
 ```
 
-**Task.cs** (39 lines)
+**ProjectTask.cs** (33 lines)
 ```csharp
-public class Task
+public class ProjectTask
 {
-    private ITaskState _currentState;  // Holds current state
+    public string Title { get; }
+    public IProjectTaskState State { get; private set; }
     
-    // Delegates all operations
-    public void Assign(string assignee) { 
-        AssignedTo = assignee;
-        _currentState.Assign(this);
+    public ProjectTask(string title)
+    {
+        Title = title;
+        State = PendingState.Instance;
+        Log($"Created Task in state: {State.Name}");
     }
-    // ... etc
+    
+    // Delegates all operations via Transition helper
+    public void Assign() => Transition(s => s.Assign(this));
+    public void Start() => Transition(s => s.Start(this));
+    // ... 4 total operations
+    
+    private void Transition(Func<IProjectTaskState, IProjectTaskState> f)
+    {
+        var next = f(State);
+        if (!ReferenceEquals(next, State))
+        {
+            Log($"Transition: {State.Name} -> {next.Name}");
+            State = next!;
+        }
+    }
 }
 ```
 
 #### 2. State Interfaces (Event-Handling Methods)
-**IProjectState.cs** (18 lines)
+**IProjectState.cs** (16 lines)
 ```csharp
 public interface IProjectState
 {
-    void Submit(Project context);
-    void Approve(Project context);
-    void Kickoff(Project context);
-    void MarkAtRisk(Project context);
-    void PutOnHold(Project context);
-    void Resume(Project context);
-    void Complete(Project context);
-    void Archive(Project context);
-    string GetStateName();
+    string Name { get; }  // Property to get state name
+    
+    // All methods return next state (or self if invalid)
+    IProjectState Submit(Project ctx);
+    IProjectState Approve(Project ctx);
+    IProjectState Reject(Project ctx);
+    IProjectState Kickoff(Project ctx);
+    IProjectState KpiBreach(Project ctx);
+    IProjectState Pause(Project ctx);
+    IProjectState Resume(Project ctx);
+    IProjectState Finish(Project ctx);
+    IProjectState Finalize(Project ctx);
 }
 ```
 
-**ITaskState.cs** (14 lines)
+**IProjectTaskState.cs** (11 lines)
 ```csharp
-public interface ITaskState
+public interface IProjectTaskState
 {
-    void Assign(Task context);
-    void StartWork(Task context);
-    void Complete(Task context);
-    void Verify(Task context);
-    string GetStateName();
+    string Name { get; }  // Property to get state name
+    
+    // All methods return next state (or self if invalid)
+    IProjectTaskState Assign(ProjectTask ctx);
+    IProjectTaskState Start(ProjectTask ctx);
+    IProjectTaskState Complete(ProjectTask ctx);
+    IProjectTaskState Verify(ProjectTask ctx);
 }
 ```
 
-#### 3. Concrete State Classes (Implementing Interface)
-**ProjectStates.cs** (118 lines - 8 states)
-```csharp
-public class DraftState : IProjectState
-{
-    public void Submit(Project context) => context.SetState(new SubmittedState());
-    public void Approve(Project context) { /* Invalid */ }
-    // ... implements all 9 interface methods
-}
+#### 3. Base Classes and Concrete State Classes
 
-public class SubmittedState : IProjectState { /* ... */ }
-public class ApprovedState : IProjectState { /* ... */ }
-// ... 5 more states
+**ProjectStateBase.cs** (22 lines)
+```csharp
+public abstract class ProjectStateBase : IProjectState
+{
+    public abstract string Name { get; }
+    
+    // Default implementation returns self and logs invalid operation
+    protected IProjectState Invalid(Project ctx, string evt)
+    {
+        ctx.Log($"Event '{evt}' not allowed in state {Name}");
+        return this;
+    }
+    
+    // All interface methods default to Invalid
+    public virtual IProjectState Submit(Project ctx) => Invalid(ctx, nameof(Submit));
+    public virtual IProjectState Approve(Project ctx) => Invalid(ctx, nameof(Approve));
+    // ... etc (9 total methods)
+}
 ```
 
-**TaskStates.cs** (56 lines - 5 states)
+**Individual Project State Files** (8 state classes, each in own file):
+- **DraftState.cs** - Implements Submit() → SubmittedState
+- **SubmittedState.cs** - Implements Approve() → ApprovedState, Reject() → DraftState
+- **ApprovedState.cs** - Implements Kickoff() → ActiveState (also assigns SubTask)
+- **ActiveState.cs** - Implements KpiBreach() → AtRiskState, Finish() → CompletedState
+- **AtRiskState.cs** - Implements Pause() → OnHoldState, Resume() → ActiveState, Finish() → CompletedState
+- **OnHoldState.cs** - Implements Resume() → ActiveState
+- **CompletedState.cs** - Implements Finalize() → ArchivedState
+- **ArchivedState.cs** - Terminal state (no transitions)
+
+All use **Singleton pattern**:
 ```csharp
-public class PendingState : ITaskState
+public sealed class DraftState : ProjectStateBase
 {
-    public void Assign(Task context) => context.SetState(new AssignedState());
-    public void StartWork(Task context) { /* Invalid */ }
-    // ... implements all 5 interface methods
+    private DraftState() { }
+    public static DraftState Instance { get; } = new();
+    public override string Name => "DRAFT";
+    
+    public override IProjectState Submit(Project ctx)
+    {
+        ctx.Log("Project submitted for approval.");
+        return SubmittedState.Instance;  // Returns next state
+    }
 }
-// ... 4 more states
+```
+
+**ProjectTaskStateBase.cs** (17 lines)
+```csharp
+public abstract class ProjectTaskStateBase : IProjectTaskState
+{
+    public abstract string Name { get; }
+    
+    protected IProjectTaskState Invalid(ProjectTask ctx, string evt)
+    {
+        ctx.Log($"Event '{evt}' not allowed in state {Name}");
+        return this;
+    }
+    
+    // All interface methods default to Invalid
+    public virtual IProjectTaskState Assign(ProjectTask ctx) => Invalid(ctx, nameof(Assign));
+    // ... 4 total methods
+}
+```
+
+**Individual Task State Files** (5 state classes, each in own file):
+- **PendingState.cs** - Implements Assign() → AssignedState
+- **AssignedState.cs** - Implements Start() → InProgressState
+- **InProgressState.cs** - Implements Complete() → TaskCompletedState
+- **TaskCompletedState.cs** - Implements Verify() → VerifiedState
+- **VerifiedState.cs** - Terminal state (no transitions)
+
+Example:
+```csharp
+public sealed class PendingState : ProjectTaskStateBase
+{
+    private PendingState() { }
+    public static PendingState Instance { get; } = new();
+    public override string Name => "PENDING";
+    
+    public override IProjectTaskState Assign(ProjectTask ctx)
+    {
+        ctx.Log("Assigned to department staff.");
+        return AssignedState.Instance;  // Returns next state
+    }
+}
 ```
 
 #### 4. Example Transitions
-**Program.cs** (40 lines)
+**Program.cs** (35 lines) - Two demonstration scenarios:
 ```csharp
-Project project = new Project("New Website");
-project.Submit();    // Draft → Submitted
-project.Approve();   // Submitted → Approved  
-project.Kickoff();   // Approved → Active
-project.Complete();  // Active → Completed
-project.Archive();   // Completed → Archived
+// Demo 1: Happy path with detour
+var proj = new Project("Website Revamp");
+proj.Submit();         // DRAFT → SUBMITTED
+proj.Approve();        // SUBMITTED → APPROVED  
+proj.Kickoff();        // APPROVED → ACTIVE (also assigns SubTask)
+proj.SubTask.Start();  // Task: PENDING → ASSIGNED → INPROGRESS
+proj.KpiBreach();      // ACTIVE → ATRISK
+proj.Pause();          // ATRISK → ONHOLD
+proj.Resume();         // ONHOLD → ACTIVE
+proj.SubTask.Complete();  // Task: INPROGRESS → COMPLETED
+proj.SubTask.Verify();    // Task: COMPLETED → VERIFIED
+proj.Finish();         // ACTIVE → COMPLETED
+proj.Finalize();       // COMPLETED → ARCHIVED
 
-Task task = new Task("Build Feature");
-task.Assign("Alice");   // Pending → Assigned
-task.StartWork();       // Assigned → InProgress
-task.Complete();        // InProgress → Completed
-task.Verify();          // Completed → Verified
+// Demo 2: Guardrails (invalid events are logged, not crashed)
+var p2 = new Project("Mobile App");
+p2.Kickoff();   // Invalid in DRAFT → logged, stays in DRAFT
+p2.Submit();    // Valid: DRAFT → SUBMITTED
+p2.Finish();    // Invalid in SUBMITTED → logged
 ```
 
-### Kept Lightweight ✅
-- **No detailed error messages** - Invalid transitions are empty methods with comments
-- **No extensive logging** - Just shows state transitions
-- **No business logic** - Focus is on demonstrating pattern structure
-- **Minimal demo** - Two simple scenarios showing valid transitions
-- **~250 total lines** - Enough to show structure, not overengineered
+### Key Implementation Features ✅
+- **Base classes with default behavior** - Invalid operations are handled gracefully via base class
+- **Singleton pattern for states** - Each state has a single `Instance` property (memory efficient)
+- **Type-safe transitions** - States return next state; context validates and updates
+- **Clear separation** - Each state in its own file for maintainability
+- **Minimal logging** - Just shows state transitions and key events
+- **Nested lifecycle demo** - Project contains SubTask demonstrating pattern composition
 
 ---
 
@@ -243,14 +370,14 @@ public void HandleOperation(string operation) {
                 case "Submit": currentState = "Submitted"; break;
                 case "Approve": throw new Exception(); break;
                 case "Kickoff": throw new Exception(); break;
-                // ... 8 more operations
+                // ... 6 more operations
             }
             break;
         case "Submitted":
             switch(operation) {
                 case "Submit": throw new Exception(); break;
                 case "Approve": currentState = "Approved"; break;
-                // ... 8 more operations
+                // ... 6 more operations
             }
             break;
         // ... 6 MORE states with nested switches
@@ -258,50 +385,71 @@ public void HandleOperation(string operation) {
 }
 ```
 **Problems:**
-- 8 states × 8 operations = 64 cases in ONE method
+- 8 states × 9 operations = 72 cases in ONE method
 - Hard to read and understand
 - Easy to miss a case
 - All logic in one giant file
 
 **With State Pattern:**
 ```csharp
-// Each state is its own class with clear responsibilities
-public class DraftState : IProjectState
+// Base class provides default behavior (inherited by all states)
+public abstract class ProjectStateBase : IProjectState
 {
-    public void Submit(Project c) => c.SetState(new SubmittedState()); // Valid
-    public void Approve(Project c) { /* Invalid */ }  // Clear
-    // Each method is simple and focused
+    protected IProjectState Invalid(Project ctx, string evt)
+    {
+        ctx.Log($"Event '{evt}' not allowed in state {Name}");
+        return this;
+    }
+    public virtual IProjectState Approve(Project ctx) => Invalid(ctx, nameof(Approve));
+}
+
+// Each state overrides only valid transitions
+public sealed class DraftState : ProjectStateBase
+{
+    public static DraftState Instance { get; } = new();
+    public override string Name => "DRAFT";
+    
+    public override IProjectState Submit(Project ctx)
+    {
+        ctx.Log("Project submitted for approval.");
+        return SubmittedState.Instance;  // Valid transition
+    }
+    // Approve, Kickoff, etc. handled by base class (Invalid)
 }
 ```
 **Benefits:**
-- Each state is ~15 lines in its own class
+- Each state is ~10-20 lines in its own file
 - Clear which operations are valid per state
 - Easy to find and modify specific state behavior
 - Compiler enforces completeness
+- Base class eliminates boilerplate for invalid transitions
+- Singleton pattern ensures one instance per state (memory efficient)
 
 #### 2. How Design Improves Maintainability
 
 **Separation of Concerns:**
-- Each state class handles ONE state's behavior
-- Changes to Draft state don't affect Active state
-- Easy to locate bugs (check the specific state class)
+- Each state class handles ONE state's behavior in its own file
+- Changes to DraftState don't affect ActiveState
+- Easy to locate bugs (check the specific state class file)
 
 **Single Responsibility Principle:**
-- `Project.cs` - Delegates operations
-- `DraftState.cs` - Handles Draft behavior
-- `ActiveState.cs` - Handles Active behavior
+- `Project.cs` - Manages context and delegates operations
+- `ProjectStateBase.cs` - Provides default behavior for all states
+- `DraftState.cs` - Handles Draft-specific behavior
+- `ActiveState.cs` - Handles Active-specific behavior
 - Each class has one clear job
 
 **Real Example:**
 Need to add email notification when project is submitted?
 ```csharp
 // Just modify DraftState.cs - that's it!
-public class DraftState : IProjectState
+public sealed class DraftState : ProjectStateBase
 {
-    public void Submit(Project context)
+    public override IProjectState Submit(Project ctx)
     {
-        context.SetState(new SubmittedState());
-        context.NotifyStakeholders();  // NEW - only change one file
+        ctx.NotifyStakeholders();  // NEW - only change one file
+        ctx.Log("Project submitted for approval.");
+        return SubmittedState.Instance;
     }
 }
 ```
@@ -309,40 +457,66 @@ public class DraftState : IProjectState
 #### 3. How Design Improves Scalability
 
 **Adding a New State:**
-1. Create new state class: `CancelledState.cs`
-2. Implement interface (compiler enforces all methods)
-3. Add transitions in relevant states
+1. Create new state file: `CancelledState.cs`
+2. Extend base class: `public sealed class CancelledState : ProjectStateBase`
+3. Override only valid transitions (base class handles invalid ones)
+4. Add Singleton: `public static CancelledState Instance { get; } = new();`
+5. Add transitions in relevant states to return new state
 
 **Adding a New Operation:**
-1. Add to interface: `void Postpone(Project context);`
-2. Compiler forces implementation in ALL states
-3. Can't forget any state - type safety!
+1. Add to interface: `IProjectState Postpone(Project ctx);`
+2. Add default implementation to base: `public virtual IProjectState Postpone(Project ctx) => Invalid(ctx, nameof(Postpone));`
+3. Add to context: `public void Postpone() => Transition(s => s.Postpone(this));`
+4. Override in specific states where valid
+5. Compiler enforces completeness - type safety!
 
 **Adding Business Logic:**
-- Add methods to `Project.cs`
-- States can call them: `context.NewMethod()`
-- State machine remains unchanged
+- Add methods to `Project.cs` context
+- States can call them: `ctx.NewMethod()`
+- State machine structure remains unchanged
 
 **Extensibility Example:**
 ```csharp
-// Want different workflow for different project types?
-public interface IProjectState { /* ... */ }
+// Want different workflows? Create alternate state classes
+public sealed class AgileActiveState : ProjectStateBase
+{
+    public static AgileActiveState Instance { get; } = new();
+    public override string Name => "AGILE_ACTIVE";
+    // Implement agile-specific transitions
+}
 
-// Use different state classes
-var agileProject = new Project(new AgileActiveState());
-var waterfallProject = new Project(new WaterfallActiveState());
+// States naturally compose with inheritance and interfaces
 ```
 
 ### Files to Share with Group
-1. `IProjectState.cs` - Interface definition
-2. `Project.cs` - Context implementation
-3. `ProjectStates.cs` - All concrete states
-4. `ITaskState.cs` - Task interface
-5. `Task.cs` - Task context
-6. `TaskStates.cs` - Task states
-7. `Program.cs` - Demo
-8. `README.md` - Overview
-9. This file - Detailed explanation
+
+**Project State Machine:**
+1. `Project/States/IProjectState.cs` - Interface definition
+2. `Project/States/ProjectStateBase.cs` - Base class with default behavior
+3. `Project/States/DraftState.cs` - Draft state implementation
+4. `Project/States/SubmittedState.cs` - Submitted state
+5. `Project/States/ApprovedState.cs` - Approved state
+6. `Project/States/ActiveState.cs` - Active state
+7. `Project/States/AtRiskState.cs` - At Risk state
+8. `Project/States/OnHoldState.cs` - On Hold state
+9. `Project/States/CompletedState.cs` - Completed state
+10. `Project/States/ArchivedState.cs` - Archived state
+11. `Project/Project.cs` - Context implementation
+
+**Task State Machine:**
+12. `Tasking/IProjectTaskState.cs` - Interface definition
+13. `Tasking/ProjectTaskStateBase.cs` - Base class with default behavior
+14. `Tasking/States/PendingState.cs` - Pending state
+15. `Tasking/States/AssignedState.cs` - Assigned state
+16. `Tasking/States/InProgressState.cs` - In Progress state
+17. `Tasking/States/TaskCompletedState.cs` - Task Completed state
+18. `Tasking/States/VerifiedState.cs` - Verified state
+19. `Tasking/ProjectTask.cs` - Task context
+
+**Demo and Documentation:**
+20. `Program.cs` - Demonstration scenarios
+21. `README.md` - Overview
+22. This file (`ASSIGNMENT_NOTES.md`) - Detailed explanation
 
 ---
 
@@ -357,50 +531,64 @@ var waterfallProject = new Project(new WaterfallActiveState());
 - Show state diagram on screen
 
 **2. Code Walkthrough (2 min)**
-- Show `IProjectState` interface
-- Show one concrete state (`DraftState`)
-- Show `Project` context delegating
-- Run demo showing transitions
+- Show `IProjectState` interface (returns next state)
+- Show `ProjectStateBase` (default behavior for invalid operations)
+- Show one concrete state (`DraftState` with Singleton pattern)
+- Show `Project` context with Transition helper
+- Run demo showing valid transitions and graceful handling of invalid operations
 
 **3. Benefits Explanation (1 min)**
-- Complexity: Each state is isolated vs. giant switch
-- Maintainability: Change one state class, not entire method
-- Scalability: Add states by creating new classes
+- Complexity: Each state is isolated in own file vs. giant nested switch
+- Maintainability: Change one state file, not entire method; base class eliminates boilerplate
+- Scalability: Add states by creating new classes; add operations by extending interface
+- Type Safety: Compiler enforces all states implement all operations
+- Memory Efficiency: Singleton pattern ensures one instance per state
 
 **4. Q&A Prep (30 sec)**
 Common questions:
-- Q: "Why implement all methods in each state?"
-  A: "Compiler enforces completeness - can't forget operations"
+- Q: "Why return state instead of void?"
+  A: "Type-safe transitions - context validates returned state before updating"
+- Q: "Why use Singleton pattern for states?"
+  A: "States are stateless - only one instance needed (memory efficient)"
+- Q: "Why base classes?"
+  A: "Eliminates boilerplate - only override valid transitions, base handles invalid"
 - Q: "Isn't this more files?"
-  A: "Yes, but each file is focused and testable"
+  A: "Yes, but each file is focused, testable, and easy to find"
 - Q: "When would you use this?"
-  A: "Any time you have complex state transitions - workflows, game states, etc."
+  A: "Any time you have complex state transitions - workflows, game states, UI flows, etc."
 
 ---
 
 ## Summary of Implementation
 
-| Component | Files | Lines | Purpose |
-|-----------|-------|-------|---------|
-| State Interfaces | 2 | 32 | Define operations |
-| Context Classes | 2 | 81 | Delegate behavior |
-| Concrete States | 2 | 174 | Implement transitions |
-| Demo | 1 | 40 | Show it working |
-| **Total** | **7** | **~327** | **Complete skeleton** |
+| Component | Files | Purpose |
+|-----------|-------|---------|
+| State Interfaces | 2 | Define operations (IProjectState, IProjectTaskState) |
+| Base State Classes | 2 | Provide default behavior for all states |
+| Context Classes | 2 | Delegate behavior and manage state transitions |
+| Project States | 8 | Implement Project lifecycle (Draft→Archived) |
+| Task States | 5 | Implement Task lifecycle (Pending→Verified) |
+| Demo | 1 | Show it working with two scenarios |
+| **Total** | **20** | **Complete implementation with nested lifecycles** |
 
 ### Key Achievements ✅
-- Demonstrates State Pattern structure clearly
-- Implements all required lifecycles (Project + Task)
-- Shows valid transitions
-- Keeps code lightweight and focused
-- Ready for group consolidation
-- Prepared for presentation
+- Demonstrates State Pattern structure clearly with modern C# features
+- Implements all required lifecycles (Project: 8 states + Task: 5 states)
+- Shows valid transitions with type-safe state returns
+- Base classes eliminate boilerplate while maintaining type safety
+- Singleton pattern for memory efficiency
+- Each state in own file for maintainability
+- Nested lifecycle demonstrates pattern composition
+- Graceful handling of invalid operations (logged, not crashed)
+- Ready for group consolidation and presentation
 
 ### Design Principles Applied
-1. **Single Responsibility** - Each state class has one job
-2. **Open/Closed** - Open for extension (new states), closed for modification  
+1. **Single Responsibility** - Each state class has one job; each in its own file
+2. **Open/Closed** - Open for extension (new states via inheritance), closed for modification
 3. **Dependency Inversion** - Context depends on interface, not concrete states
 4. **Separation of Concerns** - State logic separated from business logic
+5. **DRY (Don't Repeat Yourself)** - Base classes provide default behavior, eliminating boilerplate
+6. **Type Safety** - Compiler enforces all states implement all operations; return types validate transitions
 
 ---
 
